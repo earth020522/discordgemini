@@ -1,82 +1,144 @@
-import discord
+from memory_module import *
 import google.generativeai as genai
+import threading
+import json
+import discord
 
-# Discord 봇 토큰 및 Gemini API 키 설정; 평소에는 보안상 비워둘 에정
-DISCORD_TOKEN = ""
-GEMINI_API_KEY = ""
+#GEMINI API KEY
+with open("config.json", "r") as f:
+    config = json.load(f)
 
-# Gemini API 초기화
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-2.0-flash-thinking-exp-01-21')
+API_KEY = config["geminiapi"]
 
-# Discord 봇 클라이언트 생성
+#DISCORD TOKEN
+with open("config.json", "r") as f:
+    config = json.load(f)
+
+DISCORD_TOKEN = config["discordtoken"]
+ALLOWED_CHANNEL_ID = int(config["channelid"])
+
+# 봇 클라이언트 객체 생성
 intents = discord.Intents.default()
-intents.message_content = True
+intents.message_content = True  # 메시지 내용을 읽기 위한 intent 활성화
 client = discord.Client(intents=intents)
 
-# 허용할 채널 ID 리스트
-ALLOWED_CHANNEL_IDS = [1345676846855094304]
+#프롬프트 내용 입력
+BOT_NAME = "봇 이름 여기에 입력하기!"
+EDITABLE_PROMPT = """
+여기에 프롬프트 입력하기!
+"""
 
-# 프롬프트 변수 정의
-DEFAULT_PROMPT = "이 내용들은 당신의 정보이니 참고해서 답변을 작성하세요: 성별 남성, 나이 만 24살 2002년생, 외모 뚱뚱함, 취미 디시인사이드 및 아카라이브 활동 및 게임 및 개드립 치기, 가장 좋아하는 게임 히어로즈 오브 더 스톰 및 월드 오브 워크래프트. 다음은 당신이 참고해서 답변해야 할 말투입니다: 디시인사이드 식 말투 구사, 사람들을 부를 때 게시판 이용자를 줄인 단어인 게이 로 자주 부름, 너무 예민하지 않고 친구를 대하듯 쿨한 가벼운 말투, 반말. 당신은 블라자드 세계관에 대한 깊은 이해를 가지고 있으며, 이에 대한 질문을 받으면 정확한 답변을 해야 합니다. 답변은 너무 길지는 않게, 약 2~3문장 정도로 조절해야합니다. 여러 줄이 입력된다면, 가장 마지막 줄이 메시지이니 그에 집중한 답변을 해야합니다. 그 이외의 내용들은 맥락 파악을 위한 참고자료입니다. 요약 뒤에 오는 내용은 지금까지 한 채팅의 저장본을 요약한 내용이니, 현재 답변에 집중해야 합니다. 유저가 질문을 하면, 말투는 가볍더라도 답변을 거부하거나 정확하지 않은 정보를 주면 안됩니다. 정보는 항상 교차검증하여 정확한 정보를 제공하도록 합니다. 답변의 형태는 일반 문장처럼 하고, 문장의 앞에 답변: 또는 답변자 이름을 적는 일이 없도록 합니다. 이어지는 내용에 대해 답변하면 됩니다."
+#GEMINI MODEL
+mainmodel = 'gemini-2.0-flash-thinking-exp-01-21'
 
-# 채널별 대화 기록 저장
-conversation_history = {}
-MAX_HISTORY_LENGTH = 20
-SUMMARY_THRESHOLD = 10  # 요약 기준 대화 개수
+#AUTO RESPONSE TIMEOUT(sec)
+IDLE_TIMEOUT = 1800
 
-# 요약 함수
-async def summarize_conversation(channel_id):
-    summary_prompt = "다음 대화를 1000자 내로 요약해주세요:\n"
-    summary_prompt += "\n".join(conversation_history[channel_id])
-    summary_response = model.generate_content(summary_prompt)
-    return summary_response.text
+def generate_gemini_response(user_input, history, embeddings):
+    """Gemini 모델을 사용하여 응답을 생성합니다."""
+    relevant_memories = find_relevant_memory(user_input, history, embeddings)
 
-# 봇 이벤트 핸들러
-@client.event
-async def on_ready():
-    print(f'Logged in as {client.user}')
+    simcontext = "\n".join([f"{memory['speaker']}: {memory['text']}" for memory in relevant_memories])
 
-@client.event
-async def on_message(message):
-    if message.author == client.user:
-        return
+    prompt = f"""
+    현 대화와 유사한 이전 대화 내용:
+    {simcontext}
 
-    channel_id = message.channel.id
+    사용자 입력: {user_input}
+    
+    대답할 시 참고할 중요사항: {EDITABLE_PROMPT}
 
-    # 허용된 채널에서 올라온 메시지인지 확인
-    if channel_id in ALLOWED_CHANNEL_IDS:
-        # 채널별 대화 기록 초기화
-        if channel_id not in conversation_history:
-            conversation_history[channel_id] = []
+    이 정보를 참조해서 대화하듯이 대답을 출력해줘.
+    """
 
-        # 대화 기록 추가
-        conversation_history[channel_id].append(f"{message.author.name}: {message.content}")
+    model = genai.GenerativeModel(mainmodel)
+    response = model.generate_content(prompt)
+    return response.text
 
-        # 요약 기준 초과 시 요약
-        if len(conversation_history[channel_id]) > SUMMARY_THRESHOLD:
-            summary = await summarize_conversation(channel_id)
-            conversation_history[channel_id] = [f"요약: {summary}"]
+def generate_auto_response(history, embeddings):
+    """자동으로 Gemini 응답을 생성합니다."""
+    prompt = f"""
+    이전 대화 내용을 바탕으로 자연스럽게 대화를 이어 나가줘.
+    """
+    model = genai.GenerativeModel(mainmodel)
+    response = model.generate_content(prompt)
+    return response.text
 
-        # 최대 길이 초과 시 오래된 대화 삭제
-        if len(conversation_history[channel_id]) > MAX_HISTORY_LENGTH:
-            conversation_history[channel_id].pop(0)
+def main():
+    """메인 함수: 대화 시스템을 실행합니다."""
 
-        # 프롬프트 생성
-        prompt = f"{DEFAULT_PROMPT}\n"
-        prompt += "\n".join(conversation_history[channel_id])
+    genai.configure(api_key = API_KEY)
+    print("API key activated")
+    
+    history, embeddings = load_chat_history()
+    timer = None
 
-        # Gemini API 호출
-        response = model.generate_content(prompt)
+    #일정시간 답 없을시 타임아웃 처리 후 자동 응답
+    
+    async def send_discord_message(channel_id: int, message: str):
+        """특정 채널에 메시지를 보냅니다."""
+        channel = client.get_channel(channel_id)
+        if channel:
+            await channel.send(message)
+        else:
+            print(f"경고: ID가 {channel_id}인 채널을 찾을 수 없습니다.")
 
-        # 응답 전송
-        await message.channel.send(response.text)
+    def timeout_handler():
+        """타이머 만료 시 자동 응답을 생성합니다."""
+        print("대화가 없어 자동으로 응답을 생성합니다...")
+        auto_response = generate_auto_response(history, embeddings)
+        asyncio.run(send_discord_message(ALLOWED_CHANNEL_ID, auto_response))
+        history, embeddings = add_chat_log("Gemini", auto_response, history, embeddings)
+        print("Response:", auto_response)
+        start_timer()
 
-        # 봇의 응답도 대화 기록에 추가
-        conversation_history[channel_id].append(f"{client.user.name}: {response.text}")
-    else:
-        # 허용되지 않은 채널에서는 응답하지 않음
-        print(f"Ignored message from channel {channel_id}")
+    def start_timer():
+        """타이머를 시작합니다."""
+        nonlocal timer
+        timer = threading.Timer(IDLE_TIMEOUT, timeout_handler)
+        timer.start()
 
-# 봇 실행
-client.run(DISCORD_TOKEN)
+    def cancel_timer():
+        """타이머를 취소합니다."""
+        nonlocal timer
+        if timer:
+            timer.cancel()
+
+    start_timer()
+    
+    # 봇이 준비되면 실행되는 이벤트
+    @client.event
+    async def on_ready():
+        print(f'{client.user}가 가동함')
+    
+    #메시지 보낼 시
+    @client.event
+    async def on_message(message):
+        # 봇 자신이 보낸 메시지는 무시
+        if message.author == client.user:
+            return
+
+        # 사용자가 보낸 메시지에 답변
+        if message.channel.id == ALLOWED_CHANNEL_ID:
+            print(f'{message.author} (채널: {message.channel}): {message.content}')
+            user_name = message.author
+            user_input = message.content
+            cancel_timer()
+          
+            #답변 생성
+            print("generating response...")
+            gemini_response = generate_gemini_response(user_name+": "+user_input, history, embeddings)
+            history, embeddings = add_chat_log(user_name, user_input, history, embeddings)
+            history, embeddings = add_chat_log(BOT_NAME, gemini_response, history, embeddings)
+           
+            #답변을 디코 메시지로 보내기
+            print("Response:", gemini_response)
+            await message.channel.send(gemini_response)
+            start_timer()
+    
+    #봇 구동
+    client.run(DISCORD_TOKEN)
+
+if __name__ == "__main__":
+    import asyncio
+    main()
